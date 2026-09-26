@@ -1,0 +1,62 @@
+from datetime import timedelta
+from functools import partial
+from typing import Callable, Optional
+
+from analysis.flow_observation_window import (
+    FlowObservationWindow,
+    FlowObservationWindowManager,
+)
+from analysis.packet_analysis import PacketAnalysis, analyze_packet
+from application.capture_execution import _execute_capture
+from capture.packet_source import PacketSource
+
+
+def run_flow_observation_session(
+    source: PacketSource,
+    *,
+    capture_session_id: str,
+    inactivity_timeout: timedelta,
+    closed_window_consumer: Callable[[FlowObservationWindow], None],
+) -> None:
+    _run_flow_observation_session(
+        source,
+        capture_session_id=capture_session_id,
+        inactivity_timeout=inactivity_timeout,
+        closed_window_consumer=closed_window_consumer,
+        execute_analysis=partial(_execute_capture, analyze_observation=analyze_packet),
+    )
+
+
+def _run_flow_observation_session(
+    source: PacketSource,
+    *,
+    capture_session_id: str,
+    inactivity_timeout: timedelta,
+    closed_window_consumer: Callable[[FlowObservationWindow], None],
+    execute_analysis: Callable[[PacketSource, Callable[[Optional[PacketAnalysis]], None]], None],
+) -> None:
+    manager = FlowObservationWindowManager(
+        capture_session_id,
+        inactivity_timeout,
+    )
+    downstream_delivery_failed = False
+
+    def record_analysis(analysis: Optional[PacketAnalysis]) -> None:
+        nonlocal downstream_delivery_failed
+        if analysis is None:
+            return
+        update = manager.record(analysis)
+        for window in update.closed_windows:
+            try:
+                closed_window_consumer(window)
+            except BaseException:
+                downstream_delivery_failed = True
+                raise
+
+    try:
+        execute_analysis(source, record_analysis)
+    finally:
+        closed_windows = manager.end_capture_session()
+        if not downstream_delivery_failed:
+            for window in closed_windows:
+                closed_window_consumer(window)
